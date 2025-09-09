@@ -63,6 +63,32 @@ def parallelize_llama(
     ):
         raise NotImplementedError("CP support for FlexAttention is still in progress.")
 
+    # --- Handle weight tying ---
+    if model.model_args.tie_embeddings:
+        if parallel_dims.tp_enabled:
+            # Disable tying for TP>1 - embedding and head need different sharding layouts
+            raise RuntimeError(
+                "tie_embeddings=True requested but TP>1; this is not supported due to conflicting TP layouts"
+            )
+        if parallel_dims.pp_enabled:
+            # PP is not yet supported with weight tying
+            raise RuntimeError("tie_embeddings=True is not yet supported with PP>1")
+        else:
+            # Apply weight aliasing (Hugging Face Transformers style)
+            # This makes output.weight and tok_embeddings.weight the same Parameter object
+            if model.tok_embeddings is not None and model.output is not None:
+                if model.tok_embeddings.weight.shape == model.output.weight.shape:
+                    model.output.weight = model.tok_embeddings.weight
+                    logger.info(
+                        "Applied weight tying: output.weight -> tok_embeddings.weight"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Cannot tie embeddings: shape mismatch "
+                        f"tok_embeddings.weight.shape={model.tok_embeddings.weight.shape} "
+                        f"output.weight.shape={model.output.weight.shape}"
+                    )
+
     if parallel_dims.tp_enabled:
         if (
             job_config.parallelism.enable_async_tensor_parallel
@@ -399,27 +425,82 @@ def apply_fsdp(
                 f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
             )
 
+    tied = bool(getattr(getattr(model, "model_args", None), "tie_embeddings", False))
+
+    # --- Embedding & Head ---
     if model.tok_embeddings is not None:
-        fully_shard(
-            model.tok_embeddings,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward,
-        )
+        if tied and model.output is not None:
+            # Put both modules into the SAME FSDP handle to safely share the DTensor.
+            # This ensures the shared parameter is handled consistently.
+            fully_shard(
+                [model.tok_embeddings, model.output],
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+            )
+        else:
+            # Regular case: shard embedding by itself
+            fully_shard(
+                model.tok_embeddings,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+            )
+
+    # Transformer blocks as before
     for layer_id, transformer_block in model.layers.items():
         fully_shard(
             transformer_block,
             **fsdp_config,
             reshard_after_forward=reshard_after_forward,
         )
-    # As an optimization, do not reshard_after_forward the last layers by default
-    # since FSDP would prefetch them immediately after the forward pass
+
+    # --- Tail / Norm+Head ---
     if model.norm is not None and model.output is not None:
+        if tied:
+            # Head already wrapped together with embeddings above, so don't wrap it again.
+            # Just wrap norm by itself.
+            fully_shard(
+                model.norm,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward_policy == "always",
+            )
+        else:
+            # Regular case: wrap norm and output together
+            fully_shard(
+                [model.norm, model.output],
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward_policy == "always",
+            )
+    elif model.norm is not None:
+        # Edge case: norm exists but output doesn't (shouldn't happen with current code)
         fully_shard(
-            [model.norm, model.output],
+            model.norm,
             **fsdp_config,
             reshard_after_forward=reshard_after_forward_policy == "always",
         )
+
     fully_shard(model, **fsdp_config)
+
+    # Sanity check: make sure the alias actually happened and named_parameters is canonical.
+    if tied:
+        assert (
+            model.output.weight is model.tok_embeddings.weight
+        ), "Tying failed: head and embedding do not share the same Parameter object"
+
+        # Verify only one name appears in named_parameters
+        param_names = [n for n, _ in model.named_parameters()]
+        has_tok_weight = "tok_embeddings.weight" in param_names
+        has_output_weight = "output.weight" in param_names
+
+        logger.info(
+            f"[FSDP Tied Check] tok_embeddings.weight present: {has_tok_weight}, "
+            f"output.weight present: {has_output_weight}"
+        )
+
+        if has_output_weight:
+            raise RuntimeError(
+                "Both tok_embeddings.weight and output.weight appear in named_parameters. "
+                "This suggests the aliasing may not be working correctly."
+            )
 
 
 def apply_ddp(

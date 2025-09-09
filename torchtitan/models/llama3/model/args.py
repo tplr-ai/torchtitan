@@ -36,6 +36,9 @@ class TransformerModelArgs(BaseModelArgs):
     use_flex_attn: bool = False
     attn_mask_type: str = "causal"
     eos_id: int = 0
+    # New: tie token embedding and output projection weights (|V| x d)
+    # Only safe/meaningful when TP==1 (row/col sharding mismatch otherwise).
+    tie_embeddings: bool = False
 
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
         seq_len = job_config.training.seq_len
