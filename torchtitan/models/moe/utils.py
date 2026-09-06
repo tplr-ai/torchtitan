@@ -10,8 +10,6 @@ import torch
 
 from torchtitan.tools.utils import _round_up
 
-from .kernels import generate_permute_indices
-
 TOKEN_GROUP_ALIGN_SIZE_M = 8
 ValidTokenGroupAlignmentSize = Literal[8, 16, 32]
 
@@ -40,6 +38,10 @@ def set_token_group_alignment_size_m(
 
 
 def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
+    # Configuration, dense models, and the CPU expert loop do not use Triton.
+    # Load the CUDA padding kernel only when its execution path is selected.
+    from .kernels import generate_permute_indices
+
     global TOKEN_GROUP_ALIGN_SIZE_M
     x_padded_per_expert = x.shape[0] + num_local_experts * TOKEN_GROUP_ALIGN_SIZE_M
     padded_max_len = _round_up(x_padded_per_expert, TOKEN_GROUP_ALIGN_SIZE_M)
